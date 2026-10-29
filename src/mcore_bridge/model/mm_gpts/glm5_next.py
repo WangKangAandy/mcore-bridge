@@ -156,6 +156,7 @@ class Glm5NextMultiTokenPredictionLayer(McoreMultiTokenPredictionLayer):
     def __init__(self, config, *args, **kwargs):
         mtp_config = copy.copy(config)
         mtp_config.enable_hyper_connections = False
+        # New Core builds mHC from enable_mhc_connections; older Core only has the flag above.
         if hasattr(mtp_config, 'enable_mhc_connections'):
             mtp_config.enable_mhc_connections = False
         super().__init__(mtp_config, *args, **kwargs)
