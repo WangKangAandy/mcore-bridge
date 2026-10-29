@@ -301,6 +301,7 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
                 res[key] = val[0]
         n_shared_experts = res.pop('n_shared_experts')
     elif hf_model_type == 'glm5_next':
+        res['moe_router_score_function'] = 'sigmoid'
         text_config = hf_config.text_config
         num_layers = res['num_layers']
         layer_types = text_config.layer_types
@@ -309,6 +310,12 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
         # field); Megatron dev's hybrid transformer block, which expands the residual into mHC
         # streams, reads `hc_count` for the same thing.
         res['hc_count'] = res['num_residual_streams']
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        # Main (#4531) reads these; PyPI Core through 0.19.2 does not declare them.
+        if 'enable_mhc_connections' in TransformerConfig.__dataclass_fields__:
+            res['enable_mhc_connections'] = True
+            res['mhc_num_residual_streams'] = res['num_residual_streams']
         pattern = ''.join(('K' if attn == 'linear_attention' else 'D') + ('E' if mlp == 'sparse' else '-')
                           for attn, mlp in zip(layer_types, mlp_layer_types))
         res['hybrid_layer_pattern'] = pattern
