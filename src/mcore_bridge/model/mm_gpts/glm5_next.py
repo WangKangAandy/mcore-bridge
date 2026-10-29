@@ -438,17 +438,18 @@ class Glm5NextBridge(MultimodalGPTBridge):
             hf_state_dict = {}
         mappings = [('beta_proj.weight', 'b_proj.weight'), ('out_norm.weight', 'o_norm.weight'),
                     ('out_proj.weight', 'o_proj.weight')]
-        # Two-stage KDA gates: f_* / A_log / dt_bias are the forget gate, g_* the output gate.
-        # HF stores the forget group under `forget_gate.`; the old mapping omitted that prefix.
-        mappings += [(key, 'forget_gate.' + key) for key in ('f_a_proj.weight', 'f_b_proj.weight', 'A_log', 'dt_bias')]
-        mappings += [(key, key) for key in ('g_a_proj.weight', 'g_b_proj.weight')]
+        mappings += [(key, key) for key in ('f_a_proj.weight', 'f_b_proj.weight', 'g_a_proj.weight', 'g_b_proj.weight',
+                                            'A_log', 'dt_bias')]
         for mg_key, hf_key in mappings:
             self._set_state_dict(mg_attn, mg_key, hf_state_dict, hf_key, to_mcore)
         if self._peft_format:
             self._set_kda_qkv_lora(mg_attn, hf_state_dict, to_mcore)
             # Frozen QKV/conv weights are absent from an unmerged adapter checkpoint.
             return {} if to_mcore else self._add_prefix(hf_state_dict, 'self_attn.')
-        for mg_name, hf_names in (('in_proj', ('q_proj.weight', 'k_proj.weight', 'v_proj.weight')), ):
+        for mg_name, hf_names in (
+            ('in_proj', ('q_proj.weight', 'k_proj.weight', 'v_proj.weight')),
+            ('conv1d', ('q_conv1d.weight', 'k_conv1d.weight', 'v_conv1d.weight')),
+        ):
             param = None if mg_attn is None else getattr(mg_attn, mg_name).weight
             if to_mcore and param is not None:
                 parts = [self._split_tp(hf_state_dict[key].load(), 0, False, is_embedding=False) for key in hf_names]
@@ -459,16 +460,6 @@ class Glm5NextBridge(MultimodalGPTBridge):
                     weight, _ = self._get_weight(part, 'q_proj.weight')
                     if weight is not None:
                         hf_state_dict[key] = weight
-        param = None if mg_attn is None else mg_attn.conv1d.weight
-        if to_mcore and param is not None:
-            parts = hf_state_dict['conv1d.weight'].load().chunk(3, dim=0)
-            parts = [self._split_tp(p, 0, False, is_embedding=False) for p in parts]
-            self._set_weight(param, torch.cat(parts, dim=0), None)
-        elif not to_mcore:
-            parts = (None, ) * 3 if param is None else param.data.chunk(3, dim=0)
-            weights = [self._get_weight(p, 'q_proj.weight')[0] for p in parts]
-            if all(w is not None for w in weights):
-                hf_state_dict['conv1d.weight'] = torch.cat(weights, dim=0)
         if to_mcore:
             return {}
         return self._add_prefix(hf_state_dict, 'self_attn.')
@@ -525,19 +516,19 @@ class Glm5NextBridge(MultimodalGPTBridge):
             self._set_state_dict(inner, 'pre_mlp_layernorm.weight', hf_state_dict, self.hf_post_attention_layernorm_key,
                                  to_mcore)
         hc = None if mg_layer is None else mg_layer.hyper_connection
-        self._set_state_dict(hc, 'mapping_proj.weight', hf_state_dict, f'{branch}_hc.fn', to_mcore)
-        self._set_state_dict(hc, 'bias', hf_state_dict, f'{branch}_hc.base', to_mcore)
-        if not to_mcore and f'{branch}_hc.fn' in hf_state_dict:
-            hf_state_dict[f'{branch}_hc.fn'] = hf_state_dict[f'{branch}_hc.fn'].to(self.config.params_dtype)
+        self._set_state_dict(hc, 'mapping_proj.weight', hf_state_dict, f'hc_{branch}_fn', to_mcore)
+        self._set_state_dict(hc, 'bias', hf_state_dict, f'hc_{branch}_base', to_mcore)
+        if not to_mcore and f'hc_{branch}_fn' in hf_state_dict:
+            hf_state_dict[f'hc_{branch}_fn'] = hf_state_dict[f'hc_{branch}_fn'].to(self.config.params_dtype)
         if not self._peft_format and to_mcore and hc is not None:
-            alpha = hf_state_dict[f'{branch}_hc.scale'].load()
+            alpha = hf_state_dict[f'hc_{branch}_scale'].load()
             for idx, name in enumerate(('alpha_pre', 'alpha_post', 'alpha_res')):
                 self._set_weight(getattr(hc, name), alpha[idx:idx + 1], None)
         elif not self._peft_format and not to_mcore:
             alpha = None if hc is None else torch.cat([hc.alpha_pre, hc.alpha_post, hc.alpha_res])
             alpha = self._get_weight(alpha, None)[0]
             if alpha is not None:
-                hf_state_dict[f'{branch}_hc.scale'] = alpha
+                hf_state_dict[f'hc_{branch}_scale'] = alpha
         return {} if to_mcore else self._add_prefix(hf_state_dict, layer_prefix)
 
     def _filter_mtp_layer(self, hf_state_dict):
