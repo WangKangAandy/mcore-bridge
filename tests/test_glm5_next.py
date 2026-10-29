@@ -211,11 +211,6 @@ class _LazyTensor:
 def _checkpoint_state(hf_model, lm_head):
     state = {}
     for key, value in hf_model.state_dict().items():
-        if key.endswith('self_attn.conv1d.weight'):
-            prefix = key.removesuffix('conv1d.weight')
-            for name, weight in zip(('q_conv1d', 'k_conv1d', 'v_conv1d'), value.chunk(3, dim=0)):
-                state[f'model.language_model.{prefix}{name}.weight'] = weight.detach()
-            continue
         if key.endswith('mlp.experts.gate_up_proj'):
             prefix = key.removesuffix('gate_up_proj')
             for expert_idx, expert_weight in enumerate(value):
@@ -228,13 +223,6 @@ def _checkpoint_state(hf_model, lm_head):
             for expert_idx, expert_weight in enumerate(value):
                 state[f'model.language_model.{prefix}{expert_idx}.down_proj.weight'] = expert_weight.detach()
             continue
-        key = key.replace('.self_attn.forget_gate.', '.self_attn.')
-        key = key.replace('.attn_hc.fn', '.hc_attn_fn')
-        key = key.replace('.attn_hc.base', '.hc_attn_base')
-        key = key.replace('.attn_hc.scale', '.hc_attn_scale')
-        key = key.replace('.ffn_hc.fn', '.hc_ffn_fn')
-        key = key.replace('.ffn_hc.base', '.hc_ffn_base')
-        key = key.replace('.ffn_hc.scale', '.hc_ffn_scale')
         state[f'model.language_model.{key}'] = value.detach()
     state['lm_head.weight'] = lm_head.detach()
     return state
@@ -308,6 +296,7 @@ def test_glm5_parser_preserves_heterogeneous_schedules():
     assert parsed['linear_lower_bound'] == -5.0
     assert parsed['index_kpool'] == 2
     assert parsed['moe_router_load_balancing_type'] == 'none'
+    assert parsed['moe_router_score_function'] == 'sigmoid'
     # The fp32 MoE router comes from ModelConfig's own default; restating it in the parser
     # would be a second source of truth that can drift.
     assert 'moe_router_dtype' not in parsed
@@ -711,8 +700,8 @@ def test_glm5_cuda_forward_and_checkpoint_parity():
         assert set(exported) == set(checkpoint)
         for key, expected_weight in checkpoint.items():
             torch.testing.assert_close(exported[key], expected_weight)
-        assert exported['model.language_model.layers.0.self_attn.A_log'].dtype == torch.float32
-        assert exported['model.language_model.layers.0.hc_attn_base'].dtype == torch.float32
+        assert exported['model.language_model.layers.0.self_attn.forget_gate.A_log'].dtype == torch.float32
+        assert exported['model.language_model.layers.0.attn_hc.base'].dtype == torch.float32
         assert exported[
             'model.language_model.layers.1.self_attn.indexer.index_kpool_compress_ape'].dtype == torch.float32
 
@@ -1143,7 +1132,7 @@ def test_glm5_bridge_roundtrip_keeps_mixed_precision_dtypes():
     with _parallel_context():
         _, _, mcore_model, _, config = _build_parity_models(moe=True, dtype=torch.bfloat16)
         exported = _export_to_hf(config, mcore_model)
-        fp32_suffixes = ('A_log', 'dt_bias', 'hc_attn_base', 'hc_attn_scale', 'hc_ffn_base', 'hc_ffn_scale',
+        fp32_suffixes = ('A_log', 'dt_bias', 'attn_hc.base', 'attn_hc.scale', 'ffn_hc.base', 'ffn_hc.scale',
                          'e_score_correction_bias', 'conv1d.weight')
         checked = 0
         for key, value in exported.items():
