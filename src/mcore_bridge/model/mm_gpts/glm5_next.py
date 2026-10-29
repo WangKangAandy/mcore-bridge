@@ -439,7 +439,7 @@ class Glm5NextBridge(MultimodalGPTBridge):
         mappings = [('beta_proj.weight', 'b_proj.weight'), ('out_norm.weight', 'o_norm.weight'),
                     ('out_proj.weight', 'o_proj.weight')]
         # Two-stage KDA gates: f_* / A_log / dt_bias are the forget gate, g_* the output gate.
-        # Transformers nested the forget group under `forget_gate.`; g_* stayed on `self_attn`.
+        # HF stores the forget group under `forget_gate.`; the old mapping omitted that prefix.
         mappings += [(key, 'forget_gate.' + key) for key in ('f_a_proj.weight', 'f_b_proj.weight', 'A_log', 'dt_bias')]
         mappings += [(key, key) for key in ('g_a_proj.weight', 'g_b_proj.weight')]
         for mg_key, hf_key in mappings:
