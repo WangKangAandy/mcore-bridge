@@ -394,6 +394,8 @@ class Glm5NextBridge(MultimodalGPTBridge):
     additional_dim1_keys = {'o_proj', 'linear_proj'}
 
     def __deepcopy__(self, memo):
+        # ModelConfig already shares `bridge`. Core `from_config` copies `__dict__` instead, which
+        # would pickle process groups held by this object.
         memo[id(self)] = self
         return self
 
