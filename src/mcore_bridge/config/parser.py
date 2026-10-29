@@ -311,6 +311,7 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
         # streams, reads `hc_count` for the same thing.
         res['hc_count'] = res['num_residual_streams']
         from megatron.core.transformer.transformer_config import TransformerConfig
+
         # Main (#4531) reads these; PyPI Core through 0.19.2 does not declare them.
         if 'enable_mhc_connections' in TransformerConfig.__dataclass_fields__:
             res['enable_mhc_connections'] = True
