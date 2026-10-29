@@ -518,12 +518,179 @@ def test_glm5_mtp_layer_is_filtered_only_when_mtp_disabled():
     assert 'model.language_model.layers.45.input_layernorm.weight' in kept
 
 
-def test_glm5_bridge_deepcopy_shares_the_instance():
-    import copy
+@pytest.fixture
+def cpu_mapping_bridge(monkeypatch):
+    """Exercise real mapping/TP helpers; replace only device allocation and collectives."""
+    from mcore_bridge.bridge import gpt_bridge
     from mcore_bridge.model.mm_gpts.glm5_next import Glm5NextBridge
 
     bridge = object.__new__(Glm5NextBridge)
-    assert copy.deepcopy(bridge) is bridge
+    bridge.config = SimpleNamespace(
+        task_type='causal_lm',
+        padded_vocab_size=0,
+        params_dtype=torch.bfloat16,
+        num_layers=2,
+        hybrid_layer_pattern='K-')
+    bridge.tp_size = bridge.etp_size = bridge.ep_size = bridge.pp_size = 1
+    bridge.tp_rank = bridge.etp_rank = 0
+    bridge._peft_format = bridge._only_master_rank = False
+    bridge._target_device = None
+    monkeypatch.setattr(bridge, '_all_gather_tp', lambda tensor, dim, is_expert: tensor)
+    monkeypatch.setattr(bridge, '_broadcast_ep_pp', lambda tensor, is_expert: tensor)
+
+    # _set_state_dict allocates a CUDA boolean flag even for ordinary CPU parameters.
+    # Keep that allocation local to gpt_bridge; do not patch the shared torch module.
+    def cpu_flags(data, *, dtype, device):
+        assert dtype == torch.bool and device == 'cuda'
+        return torch.tensor(data, dtype=dtype)
+
+    torch_proxy = SimpleNamespace(**vars(torch))
+    torch_proxy.tensor = cpu_flags
+    monkeypatch.setattr(gpt_bridge, 'torch', torch_proxy)
+    return bridge
+
+
+def test_glm5_kda_current_hf_keys_roundtrip(cpu_mapping_bridge):
+    bridge = cpu_mapping_bridge
+    shapes = {
+        'b_proj.weight': (4, 4),
+        'o_norm.weight': (4, ),
+        'o_proj.weight': (4, 4),
+        'forget_gate.f_a_proj.weight': (2, 4),
+        'forget_gate.f_b_proj.weight': (4, 2),
+        'forget_gate.A_log': (4, ),
+        'forget_gate.dt_bias': (4, ),
+        'g_a_proj.weight': (2, 4),
+        'g_b_proj.weight': (4, 2),
+        'q_proj.weight': (4, 4),
+        'k_proj.weight': (4, 4),
+        'v_proj.weight': (4, 4),
+        'conv1d.weight': (12, 1, 3),
+    }
+    checkpoint = {
+        f'self_attn.{key}': torch.arange(math.prod(shape), dtype=torch.float32).reshape(shape) + i * 100
+        for i, (key, shape) in enumerate(shapes.items())
+    }
+    attn = SimpleNamespace()
+    aliases = {'b_proj': 'beta_proj', 'o_norm': 'out_norm', 'o_proj': 'out_proj'}
+    for key, shape in shapes.items():
+        name = key.removeprefix('forget_gate.').removesuffix('.weight')
+        if name in {'q_proj', 'k_proj', 'v_proj'}:
+            continue
+        value = torch.full(shape, float('nan'))
+        setattr(attn, aliases.get(name, name), SimpleNamespace(weight=value) if key.endswith('.weight') else value)
+    attn.in_proj = SimpleNamespace(weight=torch.full((12, 4), float('nan')))
+
+    bridge._set_kda_state(attn, {key: _LazyTensor(value) for key, value in checkpoint.items()}, True)
+    for name in ('f_a_proj', 'f_b_proj', 'A_log', 'dt_bias'):
+        value = getattr(attn, name)
+        key = name + '.weight' if hasattr(value, 'weight') else name
+        torch.testing.assert_close(
+            value.weight if hasattr(value, 'weight') else value, checkpoint[f'self_attn.forget_gate.{key}'])
+    expected_qkv = torch.cat([checkpoint[f'self_attn.{name}_proj.weight'] for name in ('q', 'k', 'v')])
+    torch.testing.assert_close(attn.in_proj.weight, expected_qkv)
+    torch.testing.assert_close(attn.conv1d.weight, checkpoint['self_attn.conv1d.weight'])
+    exported = bridge._set_kda_state(attn, {}, False)
+    assert exported.keys() == checkpoint.keys()
+    for key, value in checkpoint.items():
+        torch.testing.assert_close(exported[key], value)
+
+
+def test_glm5_kda_conv_tp2_rank_layout_and_export(cpu_mapping_bridge, monkeypatch):
+    bridge = cpu_mapping_bridge
+    bridge.tp_size = 2
+    # Isolate the fused QKV/conv path; ordinary parameter mappings are tested above.
+    monkeypatch.setattr(bridge, '_set_state_dict', lambda *args, **kwargs: None)
+    checkpoint = {
+        f'self_attn.{name}_proj.weight': torch.arange(8, dtype=torch.float32).reshape(4, 2) + i * 100
+        for i, name in enumerate(('q', 'k', 'v'))
+    }
+    checkpoint['self_attn.conv1d.weight'] = torch.arange(36, dtype=torch.float32).reshape(12, 1, 3)
+    ranks = []
+    for rank in range(2):
+        bridge.tp_rank = rank
+        attn = SimpleNamespace(
+            in_proj=SimpleNamespace(weight=torch.full((6, 2), float('nan'))),
+            conv1d=SimpleNamespace(weight=torch.full((6, 1, 3), float('nan'))))
+        bridge._set_kda_state(attn, {key: _LazyTensor(value) for key, value in checkpoint.items()}, True)
+        # Each rank owns two rows of EACH projection, not half of the fused tensor.
+        rows = torch.tensor([0, 1, 4, 5, 8, 9]) + rank * 2
+        torch.testing.assert_close(attn.conv1d.weight, checkpoint['self_attn.conv1d.weight'][rows])
+        qkv = torch.cat([checkpoint[f'self_attn.{name}_proj.weight'] for name in ('q', 'k', 'v')])
+        torch.testing.assert_close(attn.in_proj.weight, qkv[rows])
+        ranks.append(attn)
+
+    for rank, attn in enumerate(ranks):
+        bridge.tp_rank = rank
+        # Simulate all-gather using actual shards loaded on both ranks, never HF originals.
+        groups = iter([[getattr(peer, name).weight[2 * i:2 * i + 2] for peer in ranks] for name in ('in_proj', 'conv1d')
+                       for i in range(3)])
+
+        def gather(tensor, dim, is_expert):
+            assert dim == 0 and not is_expert
+            shards = next(groups)
+            torch.testing.assert_close(tensor, shards[rank])
+            return torch.cat(shards, dim=dim)
+
+        monkeypatch.setattr(bridge, '_all_gather_tp', gather)
+        exported = bridge._set_kda_state(attn, {}, False)
+        assert next(groups, None) is None
+        assert exported.keys() == checkpoint.keys()
+        for key, value in checkpoint.items():
+            torch.testing.assert_close(exported[key], value)
+
+
+@pytest.mark.parametrize('layer_idx,branch', [(0, 'attn'), (1, 'ffn')])
+def test_glm5_mhc_current_hf_keys_roundtrip(cpu_mapping_bridge, monkeypatch, layer_idx, branch):
+    bridge = cpu_mapping_bridge
+    monkeypatch.setattr(bridge, '_set_layer_attn', lambda *args: {})
+    monkeypatch.setattr(bridge, '_set_mlp_state', lambda *args: {})
+    hc = SimpleNamespace(
+        mapping_proj=SimpleNamespace(weight=torch.full((6, 4), float('nan'))),
+        bias=torch.full((6, ), float('nan')),
+        **{name: torch.full((1, ), float('nan'))
+           for name in ('alpha_pre', 'alpha_post', 'alpha_res')})
+    inner = SimpleNamespace(mlp=None, pre_mlp_layernorm=SimpleNamespace(weight=torch.full((4, ), float('nan'))))
+    layer = SimpleNamespace(inner_layer=inner, hyper_connection=hc)
+    prefix = 'model.language_model.layers.0.'
+    checkpoint = {
+        f'{prefix}{branch}_hc.fn': torch.arange(24, dtype=torch.bfloat16).reshape(6, 4),
+        f'{prefix}{branch}_hc.base': torch.arange(6, dtype=torch.float32),
+        f'{prefix}{branch}_hc.scale': torch.tensor([0.25, 0.5, 0.75]),
+    }
+    if branch == 'ffn':
+        checkpoint[f'{prefix}post_attention_layernorm.weight'] = torch.ones(4)
+    bridge._set_layer_state(layer, {
+        key: _LazyTensor(value)
+        for key, value in checkpoint.items()
+    }, 'model.language_model.layers.', layer_idx, True)
+    torch.testing.assert_close(hc.mapping_proj.weight, checkpoint[f'{prefix}{branch}_hc.fn'].float())
+    torch.testing.assert_close(hc.bias, checkpoint[f'{prefix}{branch}_hc.base'])
+    for i, name in enumerate(('alpha_pre', 'alpha_post', 'alpha_res')):
+        torch.testing.assert_close(getattr(hc, name), checkpoint[f'{prefix}{branch}_hc.scale'][i:i + 1])
+    exported = bridge._set_layer_state(layer, {}, 'model.language_model.layers.', layer_idx, False)
+    assert exported.keys() == checkpoint.keys()
+    for key, value in checkpoint.items():
+        torch.testing.assert_close(exported[key], value)
+
+
+def test_glm5_bridge_deepcopy_shares_the_instance():
+    import copy
+
+    from mcore_bridge.model.mm_gpts.glm5_next import Glm5NextBridge
+
+    class UncopyableProcessGroup:
+
+        def __deepcopy__(self, memo):
+            raise TypeError('process group cannot be pickled')
+
+    bridge = object.__new__(Glm5NextBridge)
+    bridge.tp_group = UncopyableProcessGroup()
+    config = SimpleNamespace(bridge=bridge, mutable=[1])
+    copied = copy.deepcopy(config.__dict__)
+    assert copied['bridge'] is bridge
+    assert copied['mutable'] == config.mutable
+    assert copied['mutable'] is not config.mutable
 
 
 def test_glm5_mtp_layer_disables_mhc_flags(monkeypatch):

@@ -437,8 +437,7 @@ class Glm5NextBridge(MultimodalGPTBridge):
             hf_state_dict = {}
         mappings = [('beta_proj.weight', 'b_proj.weight'), ('out_norm.weight', 'o_norm.weight'),
                     ('out_proj.weight', 'o_proj.weight')]
-        mappings += [(key, 'forget_gate.' + key) for key in
-                     ('f_a_proj.weight', 'f_b_proj.weight', 'A_log', 'dt_bias')]
+        mappings += [(key, 'forget_gate.' + key) for key in ('f_a_proj.weight', 'f_b_proj.weight', 'A_log', 'dt_bias')]
         mappings += [(key, key) for key in ('g_a_proj.weight', 'g_b_proj.weight')]
         for mg_key, hf_key in mappings:
             self._set_state_dict(mg_attn, mg_key, hf_state_dict, hf_key, to_mcore)
@@ -446,9 +445,7 @@ class Glm5NextBridge(MultimodalGPTBridge):
             self._set_kda_qkv_lora(mg_attn, hf_state_dict, to_mcore)
             # Frozen QKV/conv weights are absent from an unmerged adapter checkpoint.
             return {} if to_mcore else self._add_prefix(hf_state_dict, 'self_attn.')
-        for mg_name, hf_names in (
-            ('in_proj', ('q_proj.weight', 'k_proj.weight', 'v_proj.weight')),
-        ):
+        for mg_name, hf_names in (('in_proj', ('q_proj.weight', 'k_proj.weight', 'v_proj.weight')), ):
             param = None if mg_attn is None else getattr(mg_attn, mg_name).weight
             if to_mcore and param is not None:
                 parts = [self._split_tp(hf_state_dict[key].load(), 0, False, is_embedding=False) for key in hf_names]
