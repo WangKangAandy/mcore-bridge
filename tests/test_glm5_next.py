@@ -308,7 +308,6 @@ def test_glm5_parser_preserves_heterogeneous_schedules():
     assert parsed['linear_lower_bound'] == -5.0
     assert parsed['index_kpool'] == 2
     assert parsed['moe_router_load_balancing_type'] == 'none'
-    assert parsed['moe_router_score_function'] == 'sigmoid'
     assert parsed['enable_hyper_connections'] is True
     from megatron.core.transformer.transformer_config import TransformerConfig
     if 'enable_mhc_connections' in TransformerConfig.__dataclass_fields__:

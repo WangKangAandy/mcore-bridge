@@ -301,7 +301,6 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
                 res[key] = val[0]
         n_shared_experts = res.pop('n_shared_experts')
     elif hf_model_type == 'glm5_next':
-        res['moe_router_score_function'] = 'sigmoid'
         text_config = hf_config.text_config
         num_layers = res['num_layers']
         layer_types = text_config.layer_types
