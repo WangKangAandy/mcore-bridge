@@ -17,13 +17,14 @@ class HybridModel(McoreHybridModel):
     """Thin adapter over megatron-core's HybridModel.
 
     Upstream `HybridModel` already covers embedding, the hybrid layer stack, MTP
-    (via `process_mtp_loss`) and the loss/logits tail, so only two things are added
+    (via `process_mtp_loss`) and the loss/logits tail, so three things are added
     here:
 
     1. Translate `ModelConfig` into the upstream constructor signature.
     2. Build `padding_mask`, which upstream takes as a forward argument but never
        computes. Deriving it needs the CP size, the TP size and the current TP rank,
        so it stays on this side rather than leaking into the caller.
+    3. Keep frozen decoder inputs differentiable during full recomputation.
     """
 
     config: ModelConfig
@@ -57,6 +58,22 @@ class HybridModel(McoreHybridModel):
             rotary_base=config.rotary_base,
             vp_stage=vp_stage,
         )
+
+        # Full recomputation requires a differentiable activation input even
+        # when PEFT freezes the embedding and all non-adapter parameters.
+        self.decoder.register_forward_pre_hook(self._require_decoder_input_grad, with_kwargs=True)
+
+    @staticmethod
+    def _require_decoder_input_grad(module, args, kwargs):
+        if (not module.training or not torch.is_grad_enabled() or module.config.recompute_granularity != 'full'):
+            return
+        # Later PP stages consume input_tensor rather than hidden_states.
+        if not module.pre_process:
+            hidden_states = module.input_tensor
+        else:
+            hidden_states = kwargs.get('hidden_states', args[0] if args else None)
+        if hidden_states is not None and not hidden_states.requires_grad:
+            hidden_states.requires_grad_(True)
 
     @staticmethod
     def _resolve_hybrid_layer_pattern(config: ModelConfig) -> Optional[str]:
