@@ -61,6 +61,7 @@ class HybridModel(McoreHybridModel):
 
         # Full recomputation requires a differentiable activation input even
         # when PEFT freezes the embedding and all non-adapter parameters.
+        # Compatibility protection for Core's reentrant checkpoint path.
         self.decoder.register_forward_pre_hook(self._require_decoder_input_grad, with_kwargs=True)
 
     @staticmethod

@@ -9,13 +9,38 @@ input routing is simulated; this is not a distributed or Flash-kernel test.
 import pytest
 import torch
 from contextlib import contextmanager, nullcontext
-from megatron.core.models.hybrid.hybrid_model import HybridModel as CoreModel
-from megatron.core.recompute import checkpointed_forward
-from megatron.core.tensor_parallel import random as core_random
-from megatron.core.transformer.hyper_connection import HyperConnectionModule
+from importlib import import_module
 from types import SimpleNamespace
 
-from mcore_bridge.model.hybrid_model import HybridModel
+# HybridModel and the shared recompute helper are absent in older supported
+# Core releases. Gate these imports before importing bridge's Hybrid adapter.
+core_hybrid = pytest.importorskip('megatron.core.models.hybrid.hybrid_model')
+core_recompute = pytest.importorskip('megatron.core.recompute')
+core_random = pytest.importorskip('megatron.core.tensor_parallel.random')
+core_hyper = pytest.importorskip('megatron.core.transformer.hyper_connection')
+for module, names in (
+    (core_hybrid, ('HybridModel', )),
+    (core_recompute, ('checkpointed_forward', )),
+    (core_random, ('_get_all_rng_states', '_set_all_rng_states', '_fork_rng')),
+    (core_hyper, ('HyperConnectionModule', )),
+):
+    if any(not callable(getattr(module, name, None)) for name in names):
+        pytest.skip(f'{module.__name__} lacks capabilities required by this CPU regression', allow_module_level=True)
+
+CoreModel = core_hybrid.HybridModel
+checkpointed_forward = core_recompute.checkpointed_forward
+HyperConnectionModule = core_hyper.HyperConnectionModule
+if not callable(getattr(HyperConnectionModule, 'input_expand', None)):
+    pytest.skip('Core hyper-connections do not expose input_expand', allow_module_level=True)
+HybridModel = import_module('mcore_bridge.model.hybrid_model').HybridModel
+
+
+class _UnguardedHybridModel(HybridModel):
+    """Disable only the input-gradient guard, preserving unrelated module hooks."""
+
+    @staticmethod
+    def _require_decoder_input_grad(module, args, kwargs):
+        pass
 
 
 class _Embedding(torch.nn.Embedding):
@@ -47,6 +72,11 @@ class _Decoder(torch.nn.Module):
         self.pg_collection = SimpleNamespace(tp=None)
         self.input_tensor = None
         self.observed = []
+        self.other_hook_calls = 0
+        self.register_forward_pre_hook(self._count_forward)
+
+    def _count_forward(self, module, args):
+        self.other_hook_calls += 1
 
     def forward(self, hidden_states, **kwargs):
         x = hidden_states if self.pre_process else self.input_tensor
@@ -115,12 +145,8 @@ def _model(mode, path='embedding', guard=True):
         distribute_saved_activations=False,
         recompute_method='uniform',
         recompute_num_layers=1)
-    model = HybridModel(config, None, pre_process=path != 'pipeline', post_process=False)
-    if not guard:
-        # Negative control: remove the newly registered guard, reproducing the
-        # old path without changing checkpoint or the layer's trainable weights.
-        model.decoder._forward_pre_hooks.clear()
-    return model
+    model_cls = HybridModel if guard else _UnguardedHybridModel
+    return model_cls(config, None, pre_process=path != 'pipeline', post_process=False)
 
 
 def _forward(model, path):
@@ -153,10 +179,12 @@ def test_full_recompute_matches_no_recompute(path):
     broken = _model('full', path, guard=False)
     assert not _forward(broken, path).requires_grad
     assert broken.decoder.observed == [False]
+    assert broken.decoder.other_hook_calls == 1
     reference, ref_output, ref_grad = _step(None, path)
     fixed, output, grad = _step('full', path)
     assert reference.decoder.observed == [False]
     assert fixed.decoder.observed == [True]
+    assert fixed.decoder.other_hook_calls == 1
     torch.testing.assert_close(output, ref_output, rtol=0, atol=0)
     torch.testing.assert_close(grad, ref_grad, rtol=0, atol=0)
 
@@ -182,6 +210,5 @@ def test_guard_leaves_other_execution_modes_unchanged(path, mode):
 def test_guard_does_not_change_parameters_or_state_dict():
     fixed, reference = _model('full'), _model('full', guard=False)
     assert list(fixed.state_dict()) == list(reference.state_dict())
-    assert len(fixed.decoder._forward_pre_hooks) == 1
     for key in fixed.state_dict():
         torch.testing.assert_close(fixed.state_dict()[key], reference.state_dict()[key], rtol=0, atol=0)
