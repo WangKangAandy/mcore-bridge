@@ -3,6 +3,8 @@ import megatron.core
 from packaging import version
 from typing import Optional
 
+from mcore_bridge.config import MLAModelConfig
+
 from ..constant import ModelType
 from ..register import ModelLoader, ModelMeta, register_model
 
@@ -47,5 +49,6 @@ register_model(ModelMeta(
     ModelType.glm_moe_dsa,
     ['glm_moe_dsa'],
     loader=GlmMoeDsaLoader,
+    config_cls=MLAModelConfig,
     mtp_prefix='model.layers',
 ))
